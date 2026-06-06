@@ -1,5 +1,9 @@
 import axios from 'axios'
 
+// Temporary logging to investigate production env injection
+console.log('[api][env] import.meta.env:', import.meta.env)
+console.log('[api][env] import.meta.env.VITE_API_URL:', import.meta.env.VITE_API_URL)
+
 const API_URL = (() => {
   const v = import.meta.env.VITE_API_URL
   // In local dev we must not accidentally call the deployed Railway backend.
@@ -11,11 +15,10 @@ const API_URL = (() => {
   return v
 })() || ''
 
-
 console.log(
-  `[api] Initializing API client, baseURL: "${API_URL}" (from VITE_API_URL)`,
-  { raw: import.meta.env.VITE_API_URL }
+  `[api] Initializing API client, baseURL: "${API_URL}" (computed from VITE_API_URL)`
 )
+
 
 
 

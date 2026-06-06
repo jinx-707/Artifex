@@ -5,12 +5,10 @@ import path from 'path'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  define: {
-    // Ensure runtime has a sane fallback for local dev.
-    // If VITE_API_URL is missing, default to empty string so axios uses relative URLs via proxy.
-    // This prevents accidentally calling the wrong backend and ending up with empty datasets.
-    'import.meta.env.VITE_API_URL': '""',
-  },
+  // Important: do NOT override import.meta.env here.
+  // VITE_API_URL must come from Vercel/Railway env injection at build time.
+  // Overriding it to "" here erases the configured value in production.
+
   resolve: {
 
     alias: {

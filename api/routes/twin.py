@@ -147,8 +147,14 @@ async def _get_or_create_twin_state(child_id: str, pool: Any) -> dict[str, Any]:
         """
         SELECT workflow_id, family_id, status, risk_score, created_at
         FROM placements
-        WHERE child_id = $1 AND status IN ('active', 'approved')
-        ORDER BY created_at DESC LIMIT 1
+        WHERE child_id = $1
+        ORDER BY CASE status
+            WHEN 'active'   THEN 1
+            WHEN 'approved' THEN 2
+            WHEN 'pending_supervisor' THEN 3
+            WHEN 'pending'  THEN 4
+            ELSE 5
+        END, created_at DESC LIMIT 1
         """,
         child_id,
     )
@@ -555,16 +561,13 @@ async def simulate(
             # Require minimum data for a meaningful simulation
             risk_score = features.get("current_risk_score")
             if risk_score is None:
+                # Use a neutral default so the simulation still runs
                 logger.warning(
-                    "twin.insufficient_data",
+                    "twin.no_risk_score_using_default",
                     child_id=child_id,
                     feature_count=len([k for k, v in features.items() if v is not None]),
                 )
-                raise HTTPException(
-                    status_code=400,
-                    detail="Insufficient data for simulation — no risk score available. "
-                           "Ensure the child has completed a risk assessment.",
-                )
+                features = {**features, "current_risk_score": 50.0}
 
             interventions_dicts = [iv.model_dump() for iv in request.interventions]
             result = _build_simulated_response(

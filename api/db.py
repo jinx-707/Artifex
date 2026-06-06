@@ -133,10 +133,6 @@ async def store_workflow_event(
         return
     safe_data = data or {}
     async with _db_pool.acquire() as conn:
-        # ── If the workflow already reached a terminal state, auto-promote
-        #    any in_progress event to completed and don't downgrade
-        #    workflow_status.  This prevents a race between the background
-        #    pipeline and a user's approval action.
         current_wf_status = await conn.fetchval(
             "SELECT status FROM workflow_status WHERE workflow_id = $1",
             workflow_id,
@@ -168,7 +164,6 @@ async def store_workflow_event(
             workflow_id, status, stage, progress, json.dumps(safe_data),
         )
 
-        # Persist reasoning trace to DB if provided
         reasoning_steps = safe_data.get("reasoning", [])
         if reasoning_steps and isinstance(reasoning_steps, list):
             for i, step in enumerate(reasoning_steps):
@@ -184,37 +179,44 @@ async def store_workflow_event(
                 except Exception:
                     pass
 
-        timeline = await get_workflow_timeline(workflow_id, limit=200)
-        await broadcast_workflow_event(
+        # Fetch timeline using same connection to avoid pool exhaustion
+        timeline_rows = await conn.fetch(
+            "SELECT stage, status, data, timestamp FROM workflow_events "
+            "WHERE workflow_id = $1 ORDER BY timestamp ASC LIMIT 200",
             workflow_id,
-            {
-                "type": "workflow_event",
-                "workflow_id": workflow_id,
-                "stage": stage,
-                "status": status,
-                "progress": progress,
-                "timestamp": timestamp,
-                "current_stage": stage,
-                "payload": {
-                    **safe_data,
-                    "agent": safe_data.get("agent", stage),
-                    "action": safe_data.get("action", ""),
-                    "output": safe_data.get("output", ""),
-                    "confidence": safe_data.get("confidence"),
-                    "confidence_score": safe_data.get("confidence_score"),
-                    "latency": safe_data.get("latency", 0),
-                    "reasoning": reasoning_steps,
-                    "input": safe_data.get("input", ""),
-                    "inputData": safe_data.get("inputData", ""),
-                    "outputData": safe_data.get("outputData", ""),
-                    "decisionExplanation": safe_data.get("decisionExplanation", ""),
-                    "logs": safe_data.get("logs", []),
-                    "message": safe_data.get("message", safe_data.get("details", "")),
-                    "details": safe_data.get("details", ""),
-                },
-                "timeline": timeline,
-            },
         )
+        timeline = [dict(r) for r in timeline_rows]
+
+    await broadcast_workflow_event(
+        workflow_id,
+        {
+            "type": "workflow_event",
+            "workflow_id": workflow_id,
+            "stage": stage,
+            "status": status,
+            "progress": progress,
+            "timestamp": timestamp,
+            "current_stage": stage,
+            "payload": {
+                **safe_data,
+                "agent": safe_data.get("agent", stage),
+                "action": safe_data.get("action", ""),
+                "output": safe_data.get("output", ""),
+                "confidence": safe_data.get("confidence"),
+                "confidence_score": safe_data.get("confidence_score"),
+                "latency": safe_data.get("latency", 0),
+                "reasoning": safe_data.get("reasoning", []),
+                "input": safe_data.get("input", ""),
+                "inputData": safe_data.get("inputData", ""),
+                "outputData": safe_data.get("outputData", ""),
+                "decisionExplanation": safe_data.get("decisionExplanation", ""),
+                "logs": safe_data.get("logs", []),
+                "message": safe_data.get("message", safe_data.get("details", "")),
+                "details": safe_data.get("details", ""),
+            },
+            "timeline": timeline,
+        },
+    )
 
 
 async def get_workflow_timeline(workflow_id: str, limit: int = 100) -> list[dict]:

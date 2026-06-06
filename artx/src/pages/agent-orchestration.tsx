@@ -7,6 +7,9 @@ import ExecutionTimeline from '@/components/orchestration/ExecutionTimeline'
 import LiveEventPanel from '@/components/orchestration/LiveEventPanel'
 import DemoModeButton from '@/components/orchestration/DemoModeButton'
 import { useAgents } from '@/hooks/use-foster'
+import { useQuery } from '@tanstack/react-query'
+import api from '@/services/api'
+import { subscribeWorkflowStream } from '@/services/foster'
 import {
   type AgentType,
   type AgentStatus,
@@ -66,6 +69,21 @@ function generateId(): string {
 export default function AgentOrchestrationPage() {
   const { data: agentsData, isLoading } = useAgents()
 
+  // Fetch the most recent active workflow to subscribe to live events
+  const { data: latestPlacement } = useQuery({
+    queryKey: ['latest-active-workflow'],
+    queryFn: async () => {
+      const res = await api.get<{ placements: Array<{ workflow_id: string; status: string }> }>('/foster/placements')
+      const active = (res.data.placements || []).find(
+        (p) => !['approved', 'rejected', 'closed'].includes(p.status)
+      )
+      return active?.workflow_id || null
+    },
+    refetchInterval: 15000,
+    staleTime: 10000,
+  })
+
+  const wsRef = useRef<ReturnType<typeof subscribeWorkflowStream> | null>(null)
   const [isRunning, setIsRunning] = useState(false)
   const [agentStates, setAgentStates] = useState<Record<AgentType, { id: string; status: AgentStatus; confidence: number }>>(
     {} as Record<AgentType, { id: string; status: AgentStatus; confidence: number }>
@@ -107,7 +125,61 @@ export default function AgentOrchestrationPage() {
     }
   }, [agentsData, isRunning])
 
-  const clearAllTimers = useCallback(() => {
+  // Subscribe to live workflow events for the most recent active workflow
+  useEffect(() => {
+    if (!latestPlacement || isRunning) return
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null }
+
+    const AGENT_STAGE_MAP: Record<string, AgentType> = {
+      referral_submitted: 'intake', eligibility_validated: 'intake', child_profile_created: 'planner',
+      risk_assessment: 'risk', family_matching: 'matching', fairness_validation: 'fairness',
+      recommendation_generated: 'approval', supervisor_approval: 'approval', awaiting_approval: 'approval',
+      placement_approved: 'monitoring', placement_created: 'monitoring', monitoring_active: 'monitoring',
+    }
+
+    wsRef.current = subscribeWorkflowStream(
+      latestPlacement,
+      (msg) => {
+        if (msg.type === 'ping') return
+        const stage = (msg.stage || '').toLowerCase().replace(/\s+/g, '_')
+        const status = msg.status || ''
+        const agentId = AGENT_STAGE_MAP[stage]
+
+        if (agentId) {
+          const isComplete = status === 'completed' || status === 'approved'
+          setAgentStates((prev) => ({
+            ...prev,
+            [agentId]: {
+              ...prev[agentId],
+              status: isComplete ? 'completed' as AgentStatus : 'active' as AgentStatus,
+              confidence: Math.min(98, (prev[agentId]?.confidence ?? 50) + 15),
+            },
+          }))
+          setSteps((prev) => prev.map((s) => s.agentId === agentId
+            ? { ...s, status: isComplete ? 'completed' as const : 'active' as const }
+            : s
+          ))
+        }
+
+        const payload = msg.payload as Record<string, unknown> | undefined
+        const content = (payload?.output as string) || (payload?.details as string) ||
+          (payload?.message as string) || `${stage}: ${status}`
+        setMessages((prev) => [
+          ...prev.slice(-49),
+          {
+            id: `live-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            timestamp: new Date(),
+            from: (payload?.agent as string) || agentId || stage,
+            content,
+            type: status === 'completed' || status === 'approved' ? 'success' as const
+              : status === 'failed' ? 'error' as const : 'info' as const,
+          },
+        ])
+      },
+    )
+    return () => { wsRef.current?.close(); wsRef.current = null }
+  }, [latestPlacement, isRunning])
+
     timersRef.current.forEach(clearTimeout)
     timersRef.current = []
     if (elapsedTimerRef.current) {
@@ -238,7 +310,7 @@ export default function AgentOrchestrationPage() {
   const totalAgents = AGENT_IDS.length
 
   useEffect(() => {
-    return () => clearAllTimers()
+    return () => { clearAllTimers(); wsRef.current?.close() }
   }, [clearAllTimers])
 
   return (

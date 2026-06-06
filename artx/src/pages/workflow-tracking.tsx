@@ -49,7 +49,7 @@ function apiEventsToTimeline(events: WorkflowStage[]): TimelineEvent[] {
 
   const seen = new Map<string, TimelineEvent>()
 
-  const isNewStyleStage = (s: string) => /^[a-z]+(_[a-z]+)*$/.test(s)
+  const isNewStyleStage = (s: string) => s.length > 0 && !/^\s*$/.test(s)
 
   for (const e of events || []) {
     const stageName = e.stage || e.name || ''
@@ -226,8 +226,14 @@ export default function WorkflowTrackingPage() {
       } as WorkflowStatus
     },
     enabled: !!workflowId?.trim(),
-    refetchOnWindowFocus: false,
-    staleTime: 30_000,
+    refetchOnWindowFocus: true,
+    staleTime: 0,
+    refetchInterval: (query) => {
+      const data = query.state.data as WorkflowStatus | undefined
+      if (!data) return 5000
+      const terminal = ['approved', 'rejected', 'closed', 'completed']
+      return terminal.includes(data.status) ? false : 8000
+    },
     retry: 1,
     retryDelay: (a) => Math.min(1000 * 2 ** a, 4000),
   })
@@ -262,19 +268,30 @@ export default function WorkflowTrackingPage() {
 
         // 2. Build the live timeline incrementally
         if (msg.type === 'workflow_snapshot') {
-          // Seed from the DB snapshot
+          // Merge DB snapshot into live events (REST seed may already have data)
           const dbTimeline = Array.isArray(msg.timeline) ? msg.timeline : []
           const converted = sortTimelineEvents(apiEventsToTimeline(dbTimeline))
-          // Pre-populate the seen-keys set so subsequent live events are truly new
-          for (const ev of converted) {
-            seenEventKeys.current.add(`${ev.stage}:${ev.status}`)
-          }
-          setLiveEvents(converted)
+          setLiveEvents((prev) => {
+            // Build a merged map: existing events + snapshot, snapshot wins on rank
+            const STATUS_RANK: Record<string, number> = {
+              completed: 4, in_progress: 3, failed: 2, pending: 1,
+            }
+            const map = new Map(prev.map((e) => [e.stage, e]))
+            for (const ev of converted) {
+              const existing = map.get(ev.stage)
+              if (!existing || (STATUS_RANK[ev.status] ?? 0) >= (STATUS_RANK[existing.status] ?? 0)) {
+                map.set(ev.stage, ev)
+              }
+            }
+            const merged = sortTimelineEvents(Array.from(map.values()))
+            for (const ev of merged) seenEventKeys.current.add(`${ev.stage}:${ev.status}`)
+            return merged
+          })
           liveInitialised.current = true
           return
         }
 
-        if (msg.type === 'workflow_event' && liveInitialised.current) {
+        if (msg.type === 'workflow_event') {
           const stageName = (msg.stage || '').toLowerCase().replace(/\s+/g, '_')
           const status = (msg.status || 'in_progress') as StageStatus
           const STATUS_RANK: Record<string, number> = {
@@ -349,6 +366,18 @@ export default function WorkflowTrackingPage() {
     wsSubscriptionRef.current = sub
     return () => { sub.close(); wsSubscriptionRef.current = null }
   }, [workflowId, queryClient, isReplaying])
+
+  // Seed liveEvents from REST data when WS hasn't fired yet
+  useEffect(() => {
+    if (liveInitialised.current) return // WS snapshot already took over
+    if (!workflow?.timeline || (workflow.timeline as WorkflowStage[]).length === 0) return
+    const converted = sortTimelineEvents(apiEventsToTimeline(workflow.timeline as WorkflowStage[]))
+    if (converted.length === 0) return
+    for (const ev of converted) {
+      seenEventKeys.current.add(`${ev.stage}:${ev.status}`)
+    }
+    setLiveEvents(converted)
+  }, [workflow?.timeline])
 
   const timelineEvents = useMemo(() => {
     if (isReplaying) return MOCK_TIMELINE_EVENTS.filter((_, i) => i <= replayStep)

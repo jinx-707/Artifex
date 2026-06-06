@@ -421,22 +421,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Collect allowed origins from env (comma-separated) + hardcoded dev origins.
-_CORS_ORIGINS_ENV = os.getenv("CORS_ORIGINS", "")
-_CORS_EXTRA = [o.strip() for o in _CORS_ORIGINS_ENV.split(",") if o.strip()]
-
-CORS_ORIGINS: list[str] = [
-    *_CORS_EXTRA,
-    "https://artifex-woad-beta.vercel.app",
-    # Local dev
-    "http://localhost:3000", "http://127.0.0.1:3000",
-    "http://localhost:3001",
-    "http://localhost:5173", "http://127.0.0.1:5173",
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=[
+        "https://artifex-mir62bp4v-allu-saatvika-reddys-projects.vercel.app",
+        "https://artifex-woad-beta.vercel.app",
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://localhost:5173", "http://127.0.0.1:5173",
+    ],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],

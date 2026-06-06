@@ -26,6 +26,88 @@ import AIReasoningFeed from '@/components/workflow-timeline/AIReasoningFeed'
 import TimelineDetailDrawer from '@/components/workflow-timeline/TimelineDetailDrawer'
 import ReplayButton from '@/components/workflow-timeline/ReplayButton'
 
+// ── Pipeline stage ordering ───────────────────────────────────────────────────
+// Index position defines priority: higher index = later in pipeline.
+// Any stage with a later index being completed forces all earlier stages to completed.
+const PIPELINE_ORDER = [
+  'referral_submitted',       // 0
+  'eligibility_validated',    // 1
+  'child_profile_created',    // 2
+  'risk_assessment',          // 3
+  'family_matching',          // 4
+  'fairness_validation',      // 5
+  'recommendation_generated', // 6
+  'supervisor_approval',      // 7
+  'awaiting_approval',        // 8
+  'placement_approved',       // 9
+  'placement_created',        // 10
+  'monitoring_active',        // 11
+]
+
+const STATUS_RANK: Record<string, number> = {
+  completed: 4, in_progress: 3, failed: 2, pending: 1,
+}
+
+// Canonical mapping from raw backend status strings → StageStatus
+const RAW_STATUS_MAP: Record<string, StageStatus> = {
+  completed:   'completed',
+  approved:    'completed',
+  active:      'in_progress',
+  running:     'in_progress',
+  started:     'pending',
+  awaiting:    'in_progress',
+
+  in_progress: 'in_progress',
+  pending:     'pending',
+  failed:      'failed',
+  needs_manual_review: 'in_progress',
+}
+
+/**
+ * reconcileStages — the core fix.
+ *
+ * Rules:
+ * 1. Find the highest pipeline index that has status === 'completed'.
+ * 2. Every stage with pipeline index <= that index → force to 'completed'.
+ * 3. The highest completed stage itself stays 'completed'.
+ * 4. Stages beyond the highest completed stage keep their actual status.
+ *
+ * This means: if family_matching (idx 4) is completed, then
+ * risk_assessment (idx 3) CANNOT stay in_progress — it is forced to completed.
+ */
+function reconcileStages(events: TimelineEvent[]): TimelineEvent[] {
+  if (events.length === 0) return events
+
+  // Only consider stages we actually render in PIPELINE_ORDER.
+  // Unknown stages are left untouched.
+  let highestCompletedIdx = -1
+
+  for (const ev of events) {
+    if (ev.status === 'completed') {
+      const idx = PIPELINE_ORDER.indexOf(ev.stage)
+      if (idx > highestCompletedIdx) highestCompletedIdx = idx
+    }
+  }
+
+  console.log('[reconcile] highest completed stage index:', highestCompletedIdx,
+    highestCompletedIdx >= 0 ? `(${PIPELINE_ORDER[highestCompletedIdx]})` : '')
+
+  if (highestCompletedIdx < 0) return events
+
+  return events.map((ev) => {
+    const stageIdx = PIPELINE_ORDER.indexOf(ev.stage)
+    if (stageIdx < 0) return ev
+
+    // Force ALL stages at or before the highest completed stage → completed
+    if (stageIdx <= highestCompletedIdx && ev.status !== 'completed') {
+      console.log(`[reconcile] ${ev.stage} (idx ${stageIdx}) → completed (forced by idx ${highestCompletedIdx})`)
+      return { ...ev, status: 'completed' as StageStatus }
+    }
+    return ev
+  })
+}
+
+
 function formatPercent(value?: number | null, decimals = 0): string {
   if (value == null || Number.isNaN(value)) return '\u2014'
   const normalized = value <= 1 ? value * 100 : value
@@ -38,92 +120,77 @@ function formatRiskScore(value?: number | null): string {
   return `${normalized.toFixed(normalized < 10 ? 2 : 0)}%`
 }
 
-function apiEventsToTimeline(events: WorkflowStage[]): TimelineEvent[] {
-  const STATUS_MAP: Record<string, StageStatus> = {
-    completed: 'completed', in_progress: 'in_progress', failed: 'failed',
-    pending: 'pending', active: 'in_progress', running: 'in_progress',
-  }
-  const STATUS_RANK: Record<string, number> = {
-    completed: 4, in_progress: 3, failed: 2, pending: 1,
-  }
-
+function apiEventsToTimeline(rawEvents: WorkflowStage[]): TimelineEvent[] {
   const seen = new Map<string, TimelineEvent>()
 
-  const isNewStyleStage = (s: string) => s.length > 0 && !/^\s*$/.test(s)
-
-  for (const e of events || []) {
-    const stageName = e.stage || e.name || ''
+  for (const e of rawEvents || []) {
+    const stageName = (e.stage || e.name || '').trim()
     if (!stageName) continue
-    // Skip legacy Title Case stages (e.g. "Intake", "Eligibility Validation")
-    if (!isNewStyleStage(stageName)) continue
-    const status = STATUS_MAP[e.status] || 'pending'
 
-    // Parse e.data (which may be a raw JSON string instead of object)
+    const status: StageStatus = RAW_STATUS_MAP[e.status] ?? 'pending'
+
+    // Parse data field
     let parsedData: Record<string, unknown> = {}
     if (typeof e.data === 'object' && e.data !== null) {
       parsedData = e.data as Record<string, unknown>
-    } else if (typeof e.data === 'string' && (e.data as string).trim().startsWith('{')) {
+    } else if (typeof e.data === 'string' && e.data.trim().startsWith('{')) {
       try { parsedData = JSON.parse(e.data) } catch { parsedData = {} }
     }
-    // Parse e.details (may also be a JSON string or nested message)
+
+    // Parse details field
     let detailsStr = ''
     if (typeof e.details === 'string' && e.details.trim().startsWith('{')) {
       try {
-        const detailsParsed = JSON.parse(e.details) as Record<string, unknown>
-        parsedData = { ...parsedData, ...detailsParsed }
+        const dp = JSON.parse(e.details) as Record<string, unknown>
+        parsedData = { ...parsedData, ...dp }
       } catch { detailsStr = e.details }
-    } else { detailsStr = e.details || '' }
-
-    const agentName = parsedData.agent as string || ''
-    const agentAction = parsedData.action as string || ''
-    const agentOutput = parsedData.output as string || ''
-    const latency = typeof parsedData.latency === 'number' ? parsedData.latency : 0
-    const confidence = Number(parsedData.confidence ?? 0)
-    const confidenceScoreVal = (parsedData.confidence_score
-      ?? (confidence <= 1
-        ? Math.round(confidence * 100)
-        : Math.round(confidence))) as number
-    const reasoning = Array.isArray(parsedData.reasoning) ? parsedData.reasoning : []
-    const inputData = (parsedData.inputData as string) || (parsedData.input as string) || ''
-    const outputData = (parsedData.outputData as string) || ''
-    const decisionExplanation = (parsedData.decisionExplanation as string) || ''
-    const logs = Array.isArray(parsedData.logs) ? parsedData.logs : []
-    if (!detailsStr) {
-      detailsStr = (parsedData.message as string) || (parsedData.details as string) || ''
+    } else {
+      detailsStr = e.details || ''
     }
-    const stagePayload: Record<string, unknown> | undefined =
-      Object.keys(parsedData).length > 0 ? parsedData : undefined
 
-    const existing = seen.get(stageName)
-    const rank = STATUS_RANK[status] ?? 0
+    const agentName         = (parsedData.agent as string)              || ''
+    const agentAction       = (parsedData.action as string)             || ''
+    const agentOutput       = (parsedData.output as string)             || ''
+    const latency           = typeof parsedData.latency === 'number' ? parsedData.latency : 0
+    const confidence        = Number(parsedData.confidence ?? 0)
+    const confidenceScore   = (parsedData.confidence_score
+      ?? (confidence <= 1 ? Math.round(confidence * 100) : Math.round(confidence))) as number
+    const reasoning         = Array.isArray(parsedData.reasoning) ? parsedData.reasoning as string[] : []
+    const inputData         = (parsedData.inputData as string) || (parsedData.input as string) || ''
+    const outputData        = (parsedData.outputData as string) || ''
+    const decisionExpl      = (parsedData.decisionExplanation as string) || ''
+    const logs              = Array.isArray(parsedData.logs) ? parsedData.logs as string[] : []
+    if (!detailsStr) detailsStr = (parsedData.message as string) || (parsedData.details as string) || ''
+    const stagePayload      = Object.keys(parsedData).length > 0 ? parsedData : undefined
+
+    const existing    = seen.get(stageName)
+    const rank        = STATUS_RANK[status] ?? 0
     const existingRank = existing ? (STATUS_RANK[existing.status] ?? 0) : -1
 
-    // Always update if new status is higher rank (e.g., completed > pending)
     if (!existing || rank > existingRank) {
-      const raw = e.label || e.stage?.replace(/_/g, ' ') || e.name?.replace(/_/g, ' ') || stageName
+      const raw   = e.label || stageName.replace(/_/g, ' ')
       const label = raw.charAt(0).toUpperCase() + raw.slice(1)
       seen.set(stageName, {
         id: `api-${stageName}`,
         stage: stageName, label, status,
         agentName, agentAction, agentOutput,
-        latency, confidenceScore: confidenceScoreVal,
-        reasoning,
-        inputData, outputData, decisionExplanation, logs,
-        timestamp: e.timestamp || e.started_at,
-        startedAt: e.started_at, completedAt: e.completed_at,
-        details: detailsStr,
-        payload: stagePayload,
+        latency, confidenceScore,
+        reasoning, inputData, outputData, decisionExplanation: decisionExpl, logs,
+        timestamp:   e.timestamp || e.started_at,
+        startedAt:   e.started_at,
+        completedAt: e.completed_at,
+        details:     detailsStr || undefined,
+        payload:     stagePayload,
       })
     } else if (existing && !existing.agentName && agentName) {
-      // Populate empty agent fields from a later event that has more data
       seen.set(stageName, {
         ...existing,
-        agentName: agentName || existing.agentName,
+        agentName,
         agentAction: agentAction || existing.agentAction,
         agentOutput: agentOutput || existing.agentOutput,
-        latency: latency || existing.latency,
-        confidenceScore: confidenceScoreVal || existing.confidenceScore,
-        reasoning: reasoning.length > 0 ? reasoning : existing.reasoning,
+        latency:     latency     || existing.latency,
+        confidenceScore: confidenceScore || existing.confidenceScore,
+        reasoning:   reasoning.length > 0 ? reasoning : existing.reasoning,
       })
     }
   }
@@ -131,30 +198,70 @@ function apiEventsToTimeline(events: WorkflowStage[]): TimelineEvent[] {
   return Array.from(seen.values())
 }
 
+/** Sort events by pipeline order; unknown stages go to the end sorted by timestamp. */
 function sortTimelineEvents(events: TimelineEvent[]): TimelineEvent[] {
-  const RANK: Record<string, number> = { completed: 4, in_progress: 3, failed: 2, pending: 1 }
   return [...events].sort((a, b) => {
-    const r = (RANK[b.status] ?? 0) - (RANK[a.status] ?? 0)
-    if (r !== 0) return r
-    return (a.timestamp ? new Date(a.timestamp).getTime() : 0) - (b.timestamp ? new Date(b.timestamp).getTime() : 0)
+    const ia = PIPELINE_ORDER.indexOf(a.stage)
+    const ib = PIPELINE_ORDER.indexOf(b.stage)
+    if (ia >= 0 && ib >= 0) return ia - ib
+    if (ia >= 0) return -1
+    if (ib >= 0) return 1
+    return (a.timestamp ? new Date(a.timestamp).getTime() : 0) -
+           (b.timestamp ? new Date(b.timestamp).getTime() : 0)
   })
 }
 
+/** Build and reconcile a timeline from raw WorkflowStage events in one pass. */
+function buildTimeline(rawEvents: WorkflowStage[]): TimelineEvent[] {
+  const parsed = apiEventsToTimeline(rawEvents)
+
+  // highest stage based on completed events (for debug + correctness)
+  const highestCompletedIdx = parsed.reduce((acc, ev) => {
+    if (ev.status !== 'completed') return acc
+    const idx = PIPELINE_ORDER.indexOf(ev.stage)
+    return idx > acc ? idx : acc
+  }, -1)
+
+  console.log('[buildTimeline] highest stage:', highestCompletedIdx,
+    highestCompletedIdx >= 0 ? `(${PIPELINE_ORDER[highestCompletedIdx]})` : '')
+
+  const reconciled = reconcileStages(parsed)
+  const sorted = sortTimelineEvents(reconciled)
+
+  // Debug: show which stage reconciliation thinks is completed/highest
+  const highestAfterReconcile = sorted.reduce((acc, ev) => {
+    if (ev.status !== 'completed') return acc
+    const idx = PIPELINE_ORDER.indexOf(ev.stage)
+    return idx > acc ? idx : acc
+  }, -1)
+
+  console.log('[reconcile] highest after reconcile:', highestAfterReconcile,
+    highestAfterReconcile >= 0 ? `(${PIPELINE_ORDER[highestAfterReconcile]})` : '')
+
+  console.log('[timeline state]', sorted.map((e) => `${e.stage}=${e.status}`).join(' → '))
+  return sorted
+}
+
+
+const KNOWN_STAGE_COUNT = PIPELINE_ORDER.length
+
 function computeMetrics(events: TimelineEvent[], elapsed: number): ExecutionMetrics {
-  const completed = events.filter((e) => e.status === 'completed').length
+  const completed  = events.filter((e) => e.status === 'completed').length
   const inProgress = events.filter((e) => e.status === 'in_progress').length
-  const total = Math.max(events.length, 1)
-  const progress = total > 0 ? (completed / total) * 100 : 0
+  const total      = Math.max(events.length, KNOWN_STAGE_COUNT)
+  const progress   = events.length > 0 ? Math.min(100, (completed / total) * 100) : 0
   return {
     progress,
-    completedStages: completed,
-    totalStages: total,
-    executionTime: elapsed,
-    activeAgents: inProgress,
+    completedStages:  completed,
+    totalStages:      total,
+    executionTime:    elapsed,
+    activeAgents:     inProgress,
     messagesExchanged: events.reduce((s, e) => s + (e.reasoning?.length || 0) + (e.logs?.length || 0), 0),
-    riskScore: 45, matchScore: 30,
+    riskScore:  45,
+    matchScore: 30,
     confidenceScore: completed > 0
-      ? Math.round(events.filter((e) => e.status === 'completed').reduce((s, e) => s + e.confidenceScore, 0) / completed)
+      ? Math.round(events.filter((e) => e.status === 'completed')
+          .reduce((s, e) => s + e.confidenceScore, 0) / completed)
       : 0,
   }
 }
@@ -164,37 +271,41 @@ function extractWorkflowIdFromPath(): string {
   return m?.[1] ? decodeURIComponent(m[1]) : ''
 }
 
-const REPLAY_DELAYS = [1, 5, 9.5, 14.5, 20, 25.5, 31, 36.5, 42, 47]
+const REPLAY_DELAYS    = [1, 5, 9.5, 14.5, 20, 25.5, 31, 36.5, 42, 47]
 const REPLAY_TOTAL_STEPS = MOCK_TIMELINE_EVENTS.length
 
-export default function WorkflowTrackingPage() {
-  const params = useParams<{ workflowId: string }>()
-  const navigate = useNavigate()
-  const routeWorkflowId = params.workflowId || extractWorkflowIdFromPath()
-  const initialNormalized = routeWorkflowId ? normalizeWorkflowId(routeWorkflowId) : ''
+// ─────────────────────────────────────────────────────────────────────────────
 
-  const [workflowId, setWorkflowId] = useState(initialNormalized)
-  const [searchInput, setSearchInput] = useState(routeWorkflowId || '')
+export default function WorkflowTrackingPage() {
+  const params   = useParams<{ workflowId: string }>()
+  const navigate = useNavigate()
+
+  const routeId         = params.workflowId || extractWorkflowIdFromPath()
+  const initialNorm     = routeId ? normalizeWorkflowId(routeId) : ''
+
+  const [workflowId,   setWorkflowId]   = useState(initialNorm)
+  const [searchInput,  setSearchInput]  = useState(routeId || '')
   const queryClient = useQueryClient()
-  const wsSubscriptionRef = useRef<ReturnType<typeof subscribeWorkflowStream> | null>(null)
+
+  const wsRef       = useRef<ReturnType<typeof subscribeWorkflowStream> | null>(null)
   const [selectedStageId, setSelectedStageId] = useState<string | null>(null)
-  const [drawerStageId, setDrawerStageId] = useState<string | null>(null)
-  const [activeTab, setActiveTab] = useState<'activity' | 'reasoning'>('activity')
+  const [drawerStageId,   setDrawerStageId]   = useState<string | null>(null)
+  const [activeTab,       setActiveTab]       = useState<'activity' | 'reasoning'>('activity')
 
   const [isReplaying, setIsReplaying] = useState(false)
   const [hasReplayed, setHasReplayed] = useState(false)
-  const [replayStep, setReplayStep] = useState(-1)
-  const [elapsed, setElapsed] = useState(0)
-  const timersRef = useRef<ReturnType<typeof setTimeout>[]>([])
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [replayStep,  setReplayStep]  = useState(-1)
+  const [elapsed,     setElapsed]     = useState(0)
+  const timersRef    = useRef<ReturnType<typeof setTimeout>[]>([])
+  const intervalRef  = useRef<ReturnType<typeof setInterval> | null>(null)
   const startTimeRef = useRef(0)
 
-  // ── Incrementally-built live timeline (separate from REST snapshot) ─────
-  // Each incoming WS event appends ONE item so AnimatePresence can detect
-  // new insertions and play the entrance animation.
+  // liveEvents is the single source of truth for the displayed timeline
   const [liveEvents, setLiveEvents] = useState<TimelineEvent[]>([])
-  const seenEventKeys = useRef<Set<string>>(new Set())
-  const liveInitialised = useRef(false)
+  // seenKeys prevents duplicate WS events from being applied twice
+  const seenKeys = useRef<Set<string>>(new Set())
+  // Track which workflowId liveEvents were last seeded for, to force re-seed on ID change
+  const seededForId = useRef<string>('')
 
   const clearAllTimers = useCallback(() => {
     timersRef.current.forEach(clearTimeout)
@@ -202,183 +313,218 @@ export default function WorkflowTrackingPage() {
     if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null }
   }, [])
 
+  // ── Sync route param → state ──────────────────────────────────────────────
   useEffect(() => {
     const id = params.workflowId || extractWorkflowIdFromPath()
     if (id) {
-      const normalized = normalizeWorkflowId(id)
-      setWorkflowId(normalized)
+      const norm = normalizeWorkflowId(id)
+      setWorkflowId(norm)
       setSearchInput(id)
-      if (normalized !== id) navigate(`/workflow/${normalized}`, { replace: true })
+      if (norm !== id) navigate(`/workflow/${norm}`, { replace: true })
     }
   }, [params.workflowId, navigate])
 
+  // ── REST query ────────────────────────────────────────────────────────────
   const { data: workflow, isLoading, error, refetch } = useQuery<WorkflowStatus>({
     queryKey: ['workflow-status', workflowId],
     queryFn: async () => {
-      if (!workflowId) throw new Error('No workflow ID provided')
+      if (!workflowId) throw new Error('No workflow ID')
+      console.log('[workflow] Loading:', workflowId)
       const res = await api.get<WorkflowStatus>(`/foster/status/${encodeURIComponent(workflowId)}`)
+      const tl = Array.isArray(res.data?.timeline) ? res.data.timeline : []
+      console.log('[workflow] Events count:', tl.length, '| current_stage:', res.data?.current_stage)
       return {
         ...res.data,
-        status: res.data?.status || 'unknown',
+        status:        res.data?.status        || 'unknown',
         current_stage: res.data?.current_stage || 'Unknown',
-        progress: typeof res.data?.progress === 'number' ? res.data.progress : 0,
-        timeline: Array.isArray(res.data?.timeline) ? res.data.timeline : [],
+        progress:      typeof res.data?.progress === 'number' ? res.data.progress : 0,
+        timeline:      tl,
       } as WorkflowStatus
     },
-    enabled: !!workflowId?.trim(),
+    enabled:              !!workflowId?.trim(),
     refetchOnWindowFocus: true,
-    staleTime: 0,
+    staleTime:            0,
     refetchInterval: (query) => {
-      const data = query.state.data as WorkflowStatus | undefined
-      if (!data) return 5000
-      const terminal = ['approved', 'rejected', 'closed', 'completed']
-      return terminal.includes(data.status) ? false : 8000
+      const d = query.state.data as WorkflowStatus | undefined
+      if (!d) return 5000
+      return ['approved', 'rejected', 'closed', 'completed'].includes(d.status) ? false : 8000
     },
-    retry: 1,
+    retry:      2,
     retryDelay: (a) => Math.min(1000 * 2 ** a, 4000),
   })
 
+  // ── Seed liveEvents from REST response ────────────────────────────────────
+  // Deps: workflowId + stable JSON of timeline content.
+  // Using both ensures the effect re-runs when either the ID changes OR
+  // the timeline content changes (e.g. after a poll refetch adds more events).
+  const timelineJson = useMemo(
+    () => JSON.stringify(workflow?.timeline ?? []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [workflow?.timeline],
+  )
+
+  useEffect(() => {
+    // workflowId not yet resolved or mismatched with what query returned
+    if (!workflowId) return
+    if (!workflow?.timeline) return
+
+    console.log('[workflow loaded]', workflowId)
+    const rawEvents = workflow.timeline as WorkflowStage[]
+    console.log('[events]', rawEvents)
+
+    const built = buildTimeline(rawEvents)
+
+
+    console.log('[rest] workflowId:', workflowId, '| raw events:', rawEvents.length, '| built:', built.length)
+    console.log('[rest] events:', built.map((e) => `${e.stage}=${e.status}`).join(', '))
+
+    if (built.length === 0) return
+
+    // If workflowId changed, force a full replace (don't merge with stale prev state)
+    const isNewWorkflow = seededForId.current !== workflowId
+    seededForId.current = workflowId
+
+    setLiveEvents((prev) => {
+      const base: TimelineEvent[] = isNewWorkflow ? [] : prev
+      // Merge: for each stage, keep the higher-ranked status
+      const map = new Map(base.map((e) => [e.stage, e]))
+      for (const ev of built) {
+        const existing = map.get(ev.stage)
+        if (!existing || (STATUS_RANK[ev.status] ?? 0) >= (STATUS_RANK[existing.status] ?? 0)) {
+          map.set(ev.stage, ev)
+          seenKeys.current.add(`${ev.stage}:${ev.status}`)
+        }
+      }
+      const merged = sortTimelineEvents(reconcileStages(Array.from(map.values())))
+      console.log('[rest] final timeline state:', merged.map((e) => `${e.stage}=${e.status}`).join(' → '))
+      return merged
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workflowId, timelineJson])  // workflowId forces re-seed when ID changes; timelineJson for content changes
+
+  // ── WebSocket subscription ────────────────────────────────────────────────
   useEffect(() => {
     if (!workflowId || isReplaying) return
-    if (wsSubscriptionRef.current) { wsSubscriptionRef.current.close(); wsSubscriptionRef.current = null }
-    // Reset live state for a new workflow
-    setLiveEvents([])
-    seenEventKeys.current = new Set()
-    liveInitialised.current = false
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null }
 
-    const sub = subscribeWorkflowStream(workflowId,
+    console.log('[ws] connecting for workflowId:', workflowId)
+
+
+    // Reset dedup keys on every new workflowId so stale entries from a
+    // previous workflow never block events for the new one
+    seenKeys.current = new Set()
+
+    const sub = subscribeWorkflowStream(
+      workflowId,
       (msg) => {
-        // Ignore application-level pings
         if (msg.type === 'ping') return
+        console.log('[ws] Received:', msg.type, '| stage:', msg.stage, '| status:', msg.status)
 
-        // 1. Always update the React Query cache with status metadata
-        queryClient.setQueryData(['workflow-status', workflowId], (current) => {
-          const existing = (current as WorkflowStatus) || {
+        // Update React Query cache metadata
+        queryClient.setQueryData(['workflow-status', workflowId], (cur) => {
+          const existing = (cur as WorkflowStatus) || {
             workflow_id: workflowId, status: 'unknown', active: true, progress: 0, timeline: [],
           }
           return {
             ...existing, ...msg,
-            status: msg.status || existing.status || 'unknown',
+            status:        msg.status        || existing.status        || 'unknown',
             current_stage: msg.current_stage || existing.current_stage || 'Unknown',
-            progress: typeof msg.progress === 'number' ? msg.progress : existing.progress || 0,
-            // Don't replace timeline from event messages – we build it incrementally below
-            timeline: existing.timeline || [],
+            progress:      typeof msg.progress === 'number' ? msg.progress : existing.progress || 0,
+            timeline:      existing.timeline || [],
           } as WorkflowStatus
         })
 
-        // 2. Build the live timeline incrementally
+        // ── Snapshot: full DB timeline from server ──────────────────────────
         if (msg.type === 'workflow_snapshot') {
-          // Merge DB snapshot into live events (REST seed may already have data)
-          const dbTimeline = Array.isArray(msg.timeline) ? msg.timeline : []
-          const converted = sortTimelineEvents(apiEventsToTimeline(dbTimeline))
+          const raw = Array.isArray(msg.timeline) ? msg.timeline as WorkflowStage[] : []
+          console.log('[ws] Snapshot events:', raw.length)
+          const built = buildTimeline(raw)
           setLiveEvents((prev) => {
-            // Build a merged map: existing events + snapshot, snapshot wins on rank
-            const STATUS_RANK: Record<string, number> = {
-              completed: 4, in_progress: 3, failed: 2, pending: 1,
-            }
             const map = new Map(prev.map((e) => [e.stage, e]))
-            for (const ev of converted) {
+            for (const ev of built) {
               const existing = map.get(ev.stage)
               if (!existing || (STATUS_RANK[ev.status] ?? 0) >= (STATUS_RANK[existing.status] ?? 0)) {
                 map.set(ev.stage, ev)
+                seenKeys.current.add(`${ev.stage}:${ev.status}`)
               }
             }
-            const merged = sortTimelineEvents(Array.from(map.values()))
-            for (const ev of merged) seenEventKeys.current.add(`${ev.stage}:${ev.status}`)
-            return merged
+            return sortTimelineEvents(reconcileStages(Array.from(map.values())))
           })
-          liveInitialised.current = true
           return
         }
 
+        // ── Individual event ────────────────────────────────────────────────
         if (msg.type === 'workflow_event') {
           const stageName = (msg.stage || '').toLowerCase().replace(/\s+/g, '_')
-          const status = (msg.status || 'in_progress') as StageStatus
-          const STATUS_RANK: Record<string, number> = {
-            completed: 4, in_progress: 3, failed: 2, pending: 1,
-          }
-          const key = `${stageName}:${status}`
-          // Deduplicate: skip if this exact stage+status combo has been seen
-          if (seenEventKeys.current.has(key)) return
-          seenEventKeys.current.add(key)
+          const status    = RAW_STATUS_MAP[msg.status || ''] ?? 'in_progress'
+          const key       = `${stageName}:${status}`
 
-          const raw = (msg.stage || '').replace(/_/g, ' ')
+          if (seenKeys.current.has(key)) return
+          seenKeys.current.add(key)
+
+          const raw   = (msg.stage || '').replace(/_/g, ' ')
           const label = raw.charAt(0).toUpperCase() + raw.slice(1)
 
-          // Try to parse any string fields in msg.payload that look like JSON
-          const safePayload = msg.payload as Record<string, unknown> | undefined
-          const parsedPayload: Record<string, unknown> = safePayload ? { ...safePayload } : {}
-          if (safePayload) {
-            for (const [k, v] of Object.entries(safePayload)) {
+          const sp = msg.payload as Record<string, unknown> | undefined
+          const pp: Record<string, unknown> = sp ? { ...sp } : {}
+          if (sp) {
+            for (const [k, v] of Object.entries(sp)) {
               if (typeof v === 'string' && v.trim().startsWith('{')) {
-                try { parsedPayload[k] = JSON.parse(v) } catch { /* keep original */ }
+                try { pp[k] = JSON.parse(v) } catch { /* keep */ }
               }
             }
           }
 
-          const newEvent: TimelineEvent = {
-            id: `live-${stageName}-${status}-${Date.now()}`,
-            stage: stageName,
-            label,
-            status,
-            agentName: (parsedPayload.agent as string) || '',
-            agentAction: (parsedPayload.action as string) || '',
-            agentOutput: (parsedPayload.output as string) || '',
-            latency: typeof parsedPayload.latency === 'number' ? parsedPayload.latency : 0,
-            confidenceScore: typeof parsedPayload.confidence === 'number'
-              ? Math.round(parsedPayload.confidence * 100)
-              : typeof parsedPayload.confidence_score === 'number'
-                ? Math.round(parsedPayload.confidence_score)
-                : 0,
-            reasoning: Array.isArray(parsedPayload.reasoning) ? parsedPayload.reasoning : [],
-            inputData: (parsedPayload.inputData as string) || (parsedPayload.input as string) || '',
-            outputData: (parsedPayload.outputData as string) || '',
-            decisionExplanation: (parsedPayload.decisionExplanation as string) || '',
-            logs: Array.isArray(parsedPayload.logs) ? parsedPayload.logs : [],
-            timestamp: msg.timestamp,
-            startedAt: msg.timestamp,
-            completedAt: status === 'completed' ? msg.timestamp : undefined,
-            details: (parsedPayload.message as string) || (parsedPayload.details as string) || undefined,
-            payload: Object.keys(parsedPayload).length > 0 ? parsedPayload : undefined,
+          const newEv: TimelineEvent = {
+            id:    `live-${stageName}-${status}-${Date.now()}`,
+            stage: stageName, label, status,
+            agentName:           (pp.agent  as string) || '',
+            agentAction:         (pp.action as string) || '',
+            agentOutput:         (pp.output as string) || '',
+            latency:             typeof pp.latency === 'number' ? pp.latency : 0,
+            confidenceScore:     typeof pp.confidence === 'number'
+                                   ? Math.round(pp.confidence * 100)
+                                   : typeof pp.confidence_score === 'number'
+                                     ? Math.round(pp.confidence_score) : 0,
+            reasoning:           Array.isArray(pp.reasoning) ? pp.reasoning as string[] : [],
+            inputData:           (pp.inputData as string) || (pp.input as string) || '',
+            outputData:          (pp.outputData as string) || '',
+            decisionExplanation: (pp.decisionExplanation as string) || '',
+            logs:                Array.isArray(pp.logs) ? pp.logs as string[] : [],
+            timestamp:           msg.timestamp,
+            startedAt:           msg.timestamp,
+            completedAt:         status === 'completed' ? msg.timestamp : undefined,
+            details:             (pp.message as string) || (pp.details as string) || undefined,
+            payload:             Object.keys(pp).length > 0 ? pp : undefined,
           }
 
           setLiveEvents((prev) => {
-            // Upsert: replace existing entry for same stage if new status rank >= old
             const newRank = STATUS_RANK[status] ?? 0
             const idx = prev.findIndex((e) => e.stage === stageName)
+            let updated: TimelineEvent[]
             if (idx >= 0) {
               const oldRank = STATUS_RANK[prev[idx].status] ?? 0
               if (newRank >= oldRank) {
-                const updated = [...prev]
-                updated[idx] = newEvent
-                return sortTimelineEvents(updated)
+                updated = [...prev]
+                updated[idx] = newEv
+              } else {
+                return prev
               }
-              return prev
+            } else {
+              updated = [...prev, newEv]
             }
-            // No existing entry for this stage — append
-            const updated = [...prev, newEvent]
-            return sortTimelineEvents(updated)
+            return sortTimelineEvents(reconcileStages(updated))
           })
         }
       },
-      () => {}, () => {},
+      () => {},
+      () => {},
     )
-    wsSubscriptionRef.current = sub
-    return () => { sub.close(); wsSubscriptionRef.current = null }
+    wsRef.current = sub
+    return () => { sub.close(); wsRef.current = null }
   }, [workflowId, queryClient, isReplaying])
 
-  // Seed liveEvents from REST data when WS hasn't fired yet
-  useEffect(() => {
-    if (liveInitialised.current) return // WS snapshot already took over
-    if (!workflow?.timeline || (workflow.timeline as WorkflowStage[]).length === 0) return
-    const converted = sortTimelineEvents(apiEventsToTimeline(workflow.timeline as WorkflowStage[]))
-    if (converted.length === 0) return
-    for (const ev of converted) {
-      seenEventKeys.current.add(`${ev.stage}:${ev.status}`)
-    }
-    setLiveEvents(converted)
-  }, [workflow?.timeline])
-
+  // ── Derived state ─────────────────────────────────────────────────────────
   const timelineEvents = useMemo(() => {
     if (isReplaying) return MOCK_TIMELINE_EVENTS.filter((_, i) => i <= replayStep)
     return liveEvents
@@ -396,41 +542,38 @@ export default function WorkflowTrackingPage() {
 
   const metrics = useMemo(() => computeMetrics(timelineEvents, elapsed), [timelineEvents, elapsed])
 
-  // Build reasoning entries from both WS events and DB timeline
   const reasoningEntries = useMemo<ReasoningEntry[]>(() => {
     if (isReplaying) {
       const ratio = replayStep / REPLAY_TOTAL_STEPS
       return MOCK_REASONING_ENTRIES.slice(0, Math.max(1, Math.floor(ratio * MOCK_REASONING_ENTRIES.length)))
     }
-    // Build from live events' reasoning chains
     const entries: ReasoningEntry[] = []
-    let idCounter = 0
+    let n = 0
     for (const ev of timelineEvents) {
-      if (ev.reasoning && ev.reasoning.length > 0) {
-        for (const step of ev.reasoning) {
-          entries.push({
-            id: `reasoning-${idCounter++}`,
-            timestamp: ev.timestamp || ev.startedAt || new Date().toISOString(),
-            agentName: ev.agentName || ev.stage.replace(/_/g, ' '),
-            content: step,
-          })
-        }
+      for (const step of (ev.reasoning || [])) {
+        entries.push({
+          id:        `reasoning-${n++}`,
+          timestamp: ev.timestamp || ev.startedAt || new Date().toISOString(),
+          agentName: ev.agentName || ev.stage.replace(/_/g, ' '),
+          content:   step,
+        })
       }
     }
     return entries
   }, [isReplaying, replayStep, timelineEvents])
 
+  // Auto-select: prefer in_progress stage, fallback to highest completed
   useEffect(() => {
-    if (timelineEvents.length > 0) {
-      const active = timelineEvents.find((e) => e.status === 'in_progress')
-      if (active) setSelectedStageId(active.id)
-      else {
-        const last = timelineEvents[timelineEvents.length - 1]
-        if (last) setSelectedStageId(last.id)
-      }
-    }
+    if (timelineEvents.length === 0) return
+    const active = timelineEvents.find((e) => e.status === 'in_progress')
+    if (active) { setSelectedStageId(active.id); return }
+    const lastCompleted = [...timelineEvents]
+      .filter((e) => e.status === 'completed')
+      .sort((a, b) => PIPELINE_ORDER.indexOf(b.stage) - PIPELINE_ORDER.indexOf(a.stage))[0]
+    if (lastCompleted) setSelectedStageId(lastCompleted.id)
   }, [timelineEvents])
 
+  // ── Replay ────────────────────────────────────────────────────────────────
   const handleReplay = useCallback(() => {
     if (isReplaying) {
       clearAllTimers()
@@ -444,7 +587,6 @@ export default function WorkflowTrackingPage() {
     intervalRef.current = setInterval(() => {
       setElapsed(Math.floor((Date.now() - startTimeRef.current) / 1000))
     }, 200)
-
     const scheduleNext = (step: number) => {
       if (step >= REPLAY_TOTAL_STEPS) {
         setTimeout(() => { setIsReplaying(false); if (intervalRef.current) clearInterval(intervalRef.current) }, 2000)
@@ -453,36 +595,61 @@ export default function WorkflowTrackingPage() {
       const delayMs = step === 0
         ? REPLAY_DELAYS[0] * 1000
         : (REPLAY_DELAYS[step] - REPLAY_DELAYS[step - 1]) * 1000
-      const timer = setTimeout(() => {
+      const t = setTimeout(() => {
         setReplayStep(step)
         if (step < MOCK_TIMELINE_EVENTS.length) setSelectedStageId(MOCK_TIMELINE_EVENTS[step].id)
         scheduleNext(step + 1)
       }, delayMs)
-      timersRef.current.push(timer)
+      timersRef.current.push(t)
     }
     scheduleNext(0)
   }, [isReplaying, clearAllTimers])
 
+  // ── Search ────────────────────────────────────────────────────────────────
+  // Key fix: we update workflowId synchronously so the query key changes,
+  // then force the new query to fetch immediately via refetchQueries.
   const handleSearch = useCallback(() => {
     const raw = searchInput.trim()
-    if (raw) {
-      const normalized = normalizeWorkflowId(raw)
-      setWorkflowId(normalized)
-      navigate(`/workflow/${normalized}`, { replace: true })
-      setIsReplaying(false); setHasReplayed(false); setReplayStep(-1)
-    }
-  }, [searchInput, navigate])
+    if (!raw) return
+    const norm = normalizeWorkflowId(raw)
+    console.log('[search] Searching for:', norm)
+
+    // Reset all live state
+    setLiveEvents([])
+    seenKeys.current = new Set()
+    seededForId.current = ''
+    setSelectedStageId(null)
+    setDrawerStageId(null)
+    setIsReplaying(false)
+    setHasReplayed(false)
+    setReplayStep(-1)
+    setElapsed(0)
+
+    // Close existing WS — the workflowId useEffect will reconnect
+    if (wsRef.current) { wsRef.current.close(); wsRef.current = null }
+
+    // Force-load immediately: update ID + kick the query/seed cycle.
+    setWorkflowId(norm)
+    // Schedule in microtask so React state updates land before refetch.
+    Promise.resolve().then(() => {
+      refetch()
+    })
+
+    navigate(`/workflow/${norm}`, { replace: true })
+  }, [searchInput, navigate, refetch])
+
 
   const handleStageClick = useCallback((id: string) => {
     setSelectedStageId(id)
     setDrawerStageId(id)
   }, [])
 
-  useEffect(() => () => clearAllTimers(), [clearAllTimers])
+  useEffect(() => () => { clearAllTimers(); wsRef.current?.close() }, [clearAllTimers])
 
-  const progressPct = Math.round(metrics.progress)
-  const showContent = !!workflowId && (!!workflow || isReplaying || isLoading || !!error)
+  const progressPct  = Math.round(metrics.progress)
+  const showContent  = !!workflowId
 
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className="space-y-5">
       <div className="flex items-center gap-4 flex-wrap">
@@ -507,12 +674,13 @@ export default function WorkflowTrackingPage() {
         </div>
       </div>
 
+      {/* Search bar */}
       <GlassCard className="p-4">
         <div className="flex flex-col sm:flex-row gap-3">
           <div className="flex-1 flex gap-2">
             <div className="flex-1">
               <Input
-                placeholder="Workflow ID (e.g. foster-3001)"
+                placeholder="Workflow ID (e.g. foster-CH-2024-006)"
                 value={searchInput}
                 onChange={(e) => setSearchInput(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
@@ -522,7 +690,7 @@ export default function WorkflowTrackingPage() {
               <Search size={14} />
               <span className="hidden sm:inline">Search</span>
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => refetch()} disabled={isReplaying}>
+            <Button variant="ghost" size="sm" onClick={() => refetch()} disabled={isReplaying || !workflowId}>
               <RefreshCw size={14} className={isLoading ? 'animate-spin' : ''} />
             </Button>
           </div>
@@ -539,7 +707,12 @@ export default function WorkflowTrackingPage() {
                 </span>
               </motion.div>
             )}
-            <ReplayButton isReplaying={isReplaying} hasReplayed={hasReplayed} onToggle={handleReplay} disabled={false} />
+            <ReplayButton
+              isReplaying={isReplaying}
+              hasReplayed={hasReplayed}
+              onToggle={handleReplay}
+              disabled={!workflowId && !hasReplayed}
+            />
           </div>
         </div>
         {workflowId && !isReplaying && (
@@ -567,13 +740,19 @@ export default function WorkflowTrackingPage() {
         )}
       </GlassCard>
 
+      {/* Main content */}
       {showContent ? (
-        <DataLoader isLoading={isLoading && !isReplaying && !!workflowId} error={!isReplaying ? error : null} refetch={refetch}>
-          {timelineEvents.length > 0 || isReplaying || workflow ? (
+        <DataLoader
+          isLoading={isLoading && !isReplaying && liveEvents.length === 0}
+          error={!isReplaying ? error : null}
+          refetch={refetch}
+        >
+          {timelineEvents.length > 0 || isReplaying || (workflow && !isLoading) ? (
             <div className="space-y-5">
               <ExecutionMetricsBar metrics={metrics} loading={false} />
 
               <div className="grid grid-cols-1 lg:grid-cols-[1.5fr_1fr] gap-5 min-h-0">
+                {/* Timeline list */}
                 <GlassCard className="p-0 overflow-hidden">
                   <div className="flex items-center justify-between px-5 py-3 border-b border-glass-border">
                     <div className="flex items-center gap-2">
@@ -594,10 +773,16 @@ export default function WorkflowTrackingPage() {
                     </div>
                   </div>
                   <div className="p-5 max-h-[600px] overflow-y-auto">
-                    <TimelineList events={timelineEvents} selectedId={selectedStageId} onSelect={handleStageClick} isReplay={isReplaying} />
+                    <TimelineList
+                      events={timelineEvents}
+                      selectedId={selectedStageId}
+                      onSelect={handleStageClick}
+                      isReplay={isReplaying}
+                    />
                   </div>
                 </GlassCard>
 
+                {/* Right panel */}
                 <div className="flex flex-col gap-4">
                   <div className="flex border-b border-glass-border">
                     <button
@@ -658,6 +843,7 @@ export default function WorkflowTrackingPage() {
                 </div>
               </div>
 
+              {/* Progress bar */}
               <div className="relative h-1.5 rounded-full bg-surface-alt overflow-hidden">
                 <motion.div
                   initial={{ width: 0 }}
@@ -670,12 +856,13 @@ export default function WorkflowTrackingPage() {
                 />
               </div>
 
+              {/* Top matches */}
               {!isReplaying && workflow?.top_matches && Array.isArray(workflow.top_matches) && workflow.top_matches.length > 0 && (
                 <GlassCard className="p-4">
                   <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Top Matches</p>
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     {workflow.top_matches.map((match, i) => {
-                      const familyObj = (match as any).family ?? match
+                      const familyObj  = (match as any).family ?? match
                       const familyName = typeof familyObj === 'object'
                         ? (familyObj as any).name ?? (familyObj as any).family_name ?? `Family ${(familyObj as any).family_id ?? ''}`
                         : String(familyObj)
@@ -728,9 +915,8 @@ export default function WorkflowTrackingPage() {
             </div>
             <Button variant="outline" size="sm" className="mt-6" onClick={() => {
               setSearchInput('foster-3001')
-              const normalized = normalizeWorkflowId('foster-3001')
-              setWorkflowId(normalized)
-              navigate(`/workflow/${normalized}`, { replace: true })
+              setWorkflowId(normalizeWorkflowId('foster-3001'))
+              navigate(`/workflow/${normalizeWorkflowId('foster-3001')}`, { replace: true })
             }}>
               <Search size={14} />
               Try Example: foster-3001

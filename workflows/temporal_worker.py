@@ -766,7 +766,7 @@ async def placement_predict_activity(child: dict, workflow_id: str) -> dict:
     """
     from services.placement_recommender import recommend_foster_family  # noqa: PLC0415
 
-    api_url = os.getenv("API_URL", "http://localhost:8000")
+    api_url = os.getenv("API_URL", "http://api:8000")
 
     async def _log_inference(payload: dict, result: dict, model_ver: str | None) -> None:
         """Fire-and-forget POST to log ML inference to ml_inference_logs."""
@@ -849,7 +849,8 @@ async def record_workflow_event_activity(
     """
     import httpx  # noqa: PLC0415
 
-    api_url = os.getenv("API_URL", "http://localhost:8000")
+    # Use API_URL env var; in Docker this should be http://api:8000
+    api_url = os.getenv("API_URL", "http://api:8000")
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             await client.post(

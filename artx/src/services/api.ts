@@ -1,8 +1,23 @@
 import axios from 'axios'
 
-const API_URL = import.meta.env.VITE_API_URL || ''
+const API_URL = (() => {
+  const v = import.meta.env.VITE_API_URL
+  // In local dev we must not accidentally call the deployed Railway backend.
+  // When VITE_API_URL is set (e.g. via artx/.env.production) and we run locally,
+  // force it back to '' so Vite's dev proxy can route relative /children, etc.
+  if (!v) return ''
+  if (typeof window !== 'undefined' && window.location.hostname === 'localhost') return ''
+  if (typeof window !== 'undefined' && window.location.hostname === '127.0.0.1') return ''
+  return v
+})() || ''
 
-console.log(`[api] Initializing API client, baseURL: "${API_URL}" (from VITE_API_URL)`)
+
+console.log(
+  `[api] Initializing API client, baseURL: "${API_URL}" (from VITE_API_URL)`,
+  { raw: import.meta.env.VITE_API_URL }
+)
+
+
 
 export class ApiError extends Error {
   status: number | null

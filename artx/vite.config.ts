@@ -5,7 +5,14 @@ import path from 'path'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  define: {
+    // Ensure runtime has a sane fallback for local dev.
+    // If VITE_API_URL is missing, default to empty string so axios uses relative URLs via proxy.
+    // This prevents accidentally calling the wrong backend and ending up with empty datasets.
+    'import.meta.env.VITE_API_URL': '""',
+  },
   resolve: {
+
     alias: {
       '@': path.resolve(__dirname, './src'),
     },

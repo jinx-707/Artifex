@@ -1,8 +1,10 @@
-- [ ] Update TimelineDetailDrawer.tsx to parse event.details if it is JSON (string/object/array), with safe fallback
-- [ ] Ensure UI never renders raw JSON blobs
-- [ ] Add structured sections: Agent, Action, Output, Confidence, Input, Reasoning (bullets), Decision Explanation
-- [ ] Render confidence as percentage, reasoning arrays as bullet lists
-- [ ] Add badges/progress bars for Risk Score and Match Score when present
-- [ ] Match card styling language from AgentActivityPanel
-- [ ] Run frontend typecheck/build or tests to ensure no TS/React errors
+- [x] Collect request URL/response body for Children page from browser Network tab
+- [ ] Confirm whether Authorization header is present when frontend calls /children
+- [x] Confirm frontend is calling `/children` on localhost:5173 (not proxied `/api/children`)
+- [x] Apply minimal code fix to ensure local Children page hits local backend `/children` endpoint
+- [ ] Add temporary (removable) logging for request URL and raw response
+- [ ] Run local dev + verify Children list renders expected 5 children
+
+
+
 

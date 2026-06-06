@@ -294,16 +294,25 @@ export async function deleteFamily(familyId: string): Promise<void> {
 }
 
 // --- WebSocket streaming helper for workflow updates ---------------------
+function _wsBaseUrl(): string {
+  const apiUrl = import.meta.env.VITE_API_URL as string | undefined
+  if (apiUrl) {
+    // Convert https://... -> wss://... or http://... -> ws://...
+    return apiUrl.replace(/^http/, 'ws').replace(/\/$/, '')
+  }
+  // Fallback: same host as page (works in local dev with Vite proxy)
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  return `${protocol}://${window.location.host}`
+}
+
 export function subscribeWorkflowStream(
   workflowId: string,
   onMessage: (msg: any) => void,
   onOpen?: () => void,
   onClose?: () => void,
 ): { close: () => void } {
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const host = window.location.host
   const token = localStorage.getItem('artifex_token') || ''
-  const url = `${protocol}://${host}/workflow/${encodeURIComponent(workflowId)}/stream?token=${encodeURIComponent(token)}`
+  const url = `${_wsBaseUrl()}/workflow/${encodeURIComponent(workflowId)}/stream?token=${encodeURIComponent(token)}`
 
   let ws: WebSocket | null = null
   let shouldClose = false
@@ -480,10 +489,8 @@ export function subscribeChildEventStream(
   onOpen?: () => void,
   onClose?: () => void,
 ): { close: () => void } {
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const host = window.location.host
   const token = localStorage.getItem('artifex_token') || ''
-  const url = `${protocol}://${host}/ws/child/${encodeURIComponent(childId)}?token=${encodeURIComponent(token)}`
+  const url = `${_wsBaseUrl()}/ws/child/${encodeURIComponent(childId)}?token=${encodeURIComponent(token)}`
 
   let ws: WebSocket | null = null
   let shouldClose = false

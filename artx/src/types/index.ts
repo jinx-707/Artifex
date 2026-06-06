@@ -123,6 +123,7 @@ export interface ApproveResponse {
 export interface Placement {
   id?: string
   workflow_id?: string
+
   child_id?: string
   family_id?: string
   family_json?: Record<string, unknown> | null
@@ -137,6 +138,11 @@ export interface Placement {
   status?: string
   current_stage?: string
   progress?: number
+
+  // API timestamp fields
+  created_at?: string | null
+  updated_at?: string | null
+
   placement_date?: string
   match_score?: number
   confidence_score?: number
@@ -146,6 +152,7 @@ export interface Placement {
   top_matches?: TopMatch[]
   feature_importance?: Array<{ feature: string; importance: number }> | any[]
 }
+
 
 export interface HealthStatus {
   status: string

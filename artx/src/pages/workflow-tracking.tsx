@@ -124,7 +124,8 @@ function apiEventsToTimeline(rawEvents: WorkflowStage[]): TimelineEvent[] {
   const seen = new Map<string, TimelineEvent>()
 
   for (const e of rawEvents || []) {
-    const stageName = (e.stage || e.name || '').trim()
+    const stageNameRaw = e.stage ?? e.name ?? ''
+    const stageName: string = typeof stageNameRaw === 'string' ? stageNameRaw.trim() : ''
     if (!stageName) continue
 
     const status: StageStatus = RAW_STATUS_MAP[e.status] ?? 'pending'
@@ -133,7 +134,7 @@ function apiEventsToTimeline(rawEvents: WorkflowStage[]): TimelineEvent[] {
     let parsedData: Record<string, unknown> = {}
     if (typeof e.data === 'object' && e.data !== null) {
       parsedData = e.data as Record<string, unknown>
-    } else if (typeof e.data === 'string' && e.data.trim().startsWith('{')) {
+    } else if (typeof e.data === 'string' && (e.data as string).trim().startsWith('{')) {
       try { parsedData = JSON.parse(e.data) } catch { parsedData = {} }
     }
 
@@ -609,9 +610,10 @@ export default function WorkflowTrackingPage() {
   // Key fix: we update workflowId synchronously so the query key changes,
   // then force the new query to fetch immediately via refetchQueries.
   const handleSearch = useCallback(() => {
-    const raw = searchInput.trim()
+    const raw: string = typeof searchInput === 'string' ? searchInput.trim() : ''
     if (!raw) return
     const norm = normalizeWorkflowId(raw)
+
     console.log('[search] Searching for:', norm)
 
     // Reset all live state
